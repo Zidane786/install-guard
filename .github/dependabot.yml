@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # install-guard ships with no Python dependencies (standard library only); this keeps the
+  # GitHub Actions used by CI (actions/checkout, actions/setup-python) up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

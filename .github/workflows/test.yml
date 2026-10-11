@@ -1,0 +1,102 @@
+name: test
+
+# Runs on every PR and every push to main, but the test suite itself only runs when a file that
+# can change behaviour changed. Docs-only changes finish in seconds with "no code changed".
+#
+# The job always runs (never skipped), because main's ruleset requires these 6 checks: a skipped
+# or never-started workflow would leave them "waiting" and block the merge.
+#
+# Files that trigger the full suite (keep in sync with CLAUDE.md / AGENTS.md "Develop and test"):
+#   plugins/**            the shipped plugin (guard engine, rules, hooks, skills, ...)
+#   tests/**              the tests themselves
+#   scripts/**            release tooling
+#   .github/workflows/**  CI and release workflows
+#   .claude-plugin/**     the marketplace manifest
+#   .gitattributes        line endings the tests depend on
+# Everything else (README.md, TEST.md, CLAUDE.md, AGENTS.md, SECURITY.md, docs/**, ...) is docs.
+# A manual run (Actions → test → Run workflow) always runs the full suite.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    defaults:
+      run:
+        # Git Bash on Windows: the same commands work on every runner.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Did anything that affects behaviour change?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Manual run: full suite."; echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/$BASE_REF...HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            RANGE="$BEFORE..HEAD"
+          else
+            echo "No previous commit to compare with: full suite."; echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only "$RANGE")
+          echo "Changed files ($RANGE):"; echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -Eq '^(plugins/|tests/|scripts/|\.github/workflows/|\.claude-plugin/|\.gitattributes$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only docs changed: skipping the test suite."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v7
+        if: steps.changes.outputs.code == 'true'
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Git identity for tests that commit
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "install-guard CI"
+          git config --global init.defaultBranch main
+
+      - name: Plugin changes carry a new version; released CHANGELOG sections stay unchanged
+        # every merge to main ships as a release (Claude Code only updates on a new version)
+        if: github.event_name == 'pull_request' && steps.changes.outputs.code == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: python scripts/check_version_bump.py "origin/$BASE_REF"
+
+      - name: Install pytest
+        if: steps.changes.outputs.code == 'true'
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run tests
+        if: steps.changes.outputs.code == 'true'
+        run: python -m pytest -q
+
+      - name: No code changed
+        if: steps.changes.outputs.code != 'true'
+        run: echo "Docs-only change — tests not needed."
