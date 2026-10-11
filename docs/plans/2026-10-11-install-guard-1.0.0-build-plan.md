@@ -116,6 +116,12 @@ image|remote","os":["any"|"windows"|"macos"|"linux"],"test":{"hit":[…],"miss":
   rules); controls per Review Focus 2; manifest-edit detection compares before/after dependency
   sets for each manifest type; commit `engine: install detection with data rules`.
 
+- [ ] **Corpus (owner requirement):** `tests/fixtures/commands/{macos,linux,windows,any}.txt`
+  hold at least **300 install/download commands** in total (every rule kind, every OS form, quoted,
+  chained, wrapped, obfuscated) that must all be detected, and `controls.txt` at least **100**
+  look-alikes that must not be (`npm run`, `pip list`, `git status`, `echo npm install`, `grep "pip
+  install"`, `curl localhost:3000`, …). `tests/test_corpus.py` asserts both, and prints counts.
+
 ### Task 4: `sources.py`: effective destinations
 
 - [ ] Tests per tool with temp HOME/APPDATA/cwd fixtures and per-OS config paths: npm (flag >
