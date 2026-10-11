@@ -23,9 +23,21 @@ Contract (shared type, see the build plan):
                  `cd`/`cd /d`/`chdir` (cmd) in the same input. None means unchanged. A `cd` inside
                  a subshell `( … )` is not assumed to leak out. Read only.
 
-`pipe_to` is deduplicated and bounded (at most a few dozen names): known execution sinks
-(sh/bash/zsh/iex/Invoke-Expression/python/node/eval/xargs/…) are always kept, other consumers are
-capped so one very long pipeline cannot blow up memory or time.
+    Cmd.truncated  (addition) True when pipe_to had consumers dropped by the cap below.
+    Cmd.budget_exceeded  (addition) True on every Cmd when the parse budget ran out (see below).
+
+`pipe_to` is deduplicated by program name (`/p0/tee` and `/p1/tee` are both `tee`) and holds at
+most 64 names: every program this parser treats as running its input (_EXEC_SINKS: all POSIX
+shells, powershell/pwsh/powershell_ise, cmd, iex/Invoke-Expression, parallel, sudo/su/sg/…,
+xargs, tee, python/node/perl/ruby/…) is always kept; other consumers are capped (nearest kept),
+and `truncated` is set when one was dropped.
+
+Parse budget (defence in depth against inputs crafted to be slow): parsing stops after 200,000
+tokenized stages or 0.45 s of wall clock (time.perf_counter). split_commands then returns what it
+has, as a `Cmds` list whose `budget_exceeded` attribute is True and whose every Cmd has
+`budget_exceeded` set; if nothing was produced, one marker Cmd whose `raw` starts with
+BUDGET_EXCEEDED is returned. Task 3 reads `cmds.budget_exceeded` (or any Cmd's flag) and treats
+the whole line as "ask": commands past the cut were not seen.
 
 Unresolvable commands (Task 3 treats these as suspicious — "unknown-exec" → ask; they are NOT
 marked here with the markers below): an argv0 that contains `$`, a backtick, `(` or a `%…%`
@@ -46,13 +58,22 @@ heredoc / here-string bodies are dropped, except a body fed to a shell (`bash <<
 and `$( … )` inside an unquoted heredoc, which runs.
 
 Unwrapping: sudo, doas, env, time, nohup, xargs, exec, command, nice, timeout, stdbuf, ionice,
-caffeinate, setsid, busybox, runuser, pkexec, find -exec, watch, su -c, eval, bash/sh/zsh/… -c,
+caffeinate, setsid, busybox, runuser, pkexec, chronic, unbuffer, coproc, chroot, firejail, nsenter,
+systemd-run, zsh noglob/nocorrect/`=cmd`, flock (incl. its own `-c`), `script -c`, sg (`-c` or a
+command string), parallel (one job per `:::` argument; no template = the arguments, or stdin
+lines, are commands), find -exec, watch, su -c, eval, bash/sh/zsh/… -c,
 cmd /c, call, start, runas, wsl, powershell/pwsh -Command / -EncodedCommand (base64 UTF-16LE,
 decoded) / positional command, Start-Process (-FilePath, -ArgumentList), Invoke-Expression/iex,
 and the PowerShell call operators `&` and `.`. The wrapper's Cmd is kept and each unwrapped
 command follows it as its own Cmd (order: source order, a wrapper before what it runs). Wrappers
 that re-parse a string (-c, /c, -Command, iex, eval, stdin scripts) nest at most MAX_DEPTH deep;
 text beyond that is returned whitespace-split with `raw` starting with DEPTH_LIMIT.
+
+cmd specifics: `cmd /c …` re-parses the rest of the command line from its raw source text and
+applies cmd's outer-quote rule (a leading `"` and the last `"` are removed), so
+`cmd /c "start "t" npm i x"` runs `start "t" npm i x`; switches may be glued (`cmd/s/c`,
+`cmd.exe/c`, `cmd /q /d/c`). `start` reads a first argument that begins with `"` as the window
+title, never as the program (`start npm"" i x` runs npm).
 
 Malformed input never raises. Unterminated quotes or substitutions make that script level fall
 back to a whitespace split on the separators above, with `raw` starting with MALFORMED; an
@@ -68,23 +89,22 @@ from __future__ import annotations
 import base64
 import gc
 import re
+import shlex
+import time
 from dataclasses import dataclass, field
 
 MAX_DEPTH = 5
 MALFORMED = "[malformed] "
 DEPTH_LIMIT = "[depth-limit] "
+BUDGET_EXCEEDED = "[budget-exceeded] "
 
 _MAX_NEST = 100  # syntactic nesting ($( … ) inside $( … ) …) before a script counts as malformed
 _MAX_ENV = 64  # tracked environment variables before the line counts as malformed
 _MAX_UNWRAP = 64  # argv-level unwraps of one command (sudo sudo sudo …)
-_MAX_PIPE_TO = 32  # non-sink consumers kept in Cmd.pipe_to (sinks below are always kept)
-
-# Commands that run whatever is piped or passed to them: never dropped from pipe_to by the cap.
-_EXEC_SINKS = frozenset(
-    "sh bash zsh dash ksh mksh ash fish rbash sudo doas su eval source xargs tee "
-    "python python3 python2 py node nodejs deno bun perl ruby php pwsh powershell "
-    "iex invoke-expression".split()
-)
+_MAX_PIPE_TOTAL = 64  # names in one Cmd.pipe_to (sinks always fit; others share the rest)
+_MAX_TICKS = 200_000  # tokenized stages before the parse budget runs out
+_MAX_SECONDS = 0.45  # wall clock before the parse budget runs out
+_MAX_PARALLEL_JOBS = 64  # `parallel … ::: a b c` jobs expanded into commands
 
 
 @dataclass
@@ -95,6 +115,14 @@ class Cmd:
     pipe_to: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: "str | None" = None
+    truncated: bool = False
+    budget_exceeded: bool = False
+
+
+class Cmds(list):
+    """split_commands' result: a list of Cmd plus `budget_exceeded` (see the module docstring)."""
+
+    budget_exceeded = False
 
 
 def split_commands(line: str, shell: str = "bash") -> list[Cmd]:
@@ -112,12 +140,21 @@ def split_commands(line: str, shell: str = "bash") -> list[Cmd]:
     collecting = gc.isenabled()
     gc.disable()
     try:
+        state = _State(budget=True)
         try:
-            _parse(line, sh, 0, {}, [], out, _State(), None)
+            _parse(line, sh, 0, {}, _EMPTY_PIPE, out, state, None)
         except Exception:  # last resort: never raise into a hook
             out = []
             _emit_crude(_crude(line, sh), sh, out)
-        return _dedup(out)
+        result = Cmds(_dedup(out))
+        if state.cut or state.timeup:
+            result.budget_exceeded = True
+            if not result:
+                words = line[:4096].translate(_CRUDE_STRIP[sh]).split()[:16] or ["?"]
+                result.append(Cmd(words, BUDGET_EXCEEDED + line[:200].strip(), sh))
+            for c in result:
+                c.budget_exceeded = True
+        return result
     finally:
         if collecting:
             gc.enable()
@@ -131,30 +168,57 @@ class _Malformed(Exception):
 
 
 class _State:
-    __slots__ = ("overflow",)
+    """Per-call state: env overflow and the parse budget (a no-limit state when budget=False)."""
 
-    def __init__(self) -> None:
+    __slots__ = ("overflow", "cut", "timeup", "ticks", "emits", "deadline", "max_ticks")
+
+    def __init__(self, budget: bool = False) -> None:
         self.overflow = False  # more env variables than _MAX_ENV: later Cmds are marked
+        self.cut = False  # stop tokenizing (stage or time budget)
+        self.timeup = False  # stop emitting too (time budget)
+        self.ticks = 0
+        self.emits = 0
+        if budget:
+            self.deadline = time.perf_counter() + _MAX_SECONDS
+            self.max_ticks = _MAX_TICKS
+        else:
+            self.deadline = float("inf")
+            self.max_ticks = float("inf")
+
+    def check(self) -> None:
+        """Called by _Builder every 1024 tokenized stages and once past max_ticks."""
+        if self.ticks > self.max_ticks:
+            self.cut = True
+        elif time.perf_counter() > self.deadline:
+            self.cut = self.timeup = True
+
+    def late(self) -> bool:
+        """One emitted stage; True once the time budget is gone (checked every 256 stages)."""
+        self.emits += 1
+        if self.emits & 255 == 1 and time.perf_counter() > self.deadline:
+            self.cut = self.timeup = True
+        return self.timeup
 
 
 class _Ctx:
-    __slots__ = ("s", "n", "heredocs")
+    __slots__ = ("s", "n", "heredocs", "state")
 
-    def __init__(self, s: str) -> None:
+    def __init__(self, s: str, state: "_State | None" = None) -> None:
         self.s = s
         self.n = len(s)
         self.heredocs: list = []
+        self.state = state if state is not None else _State()
 
 
 class _Stage:
     """One simple command (or group) while tokenizing."""
 
-    __slots__ = ("words", "joins", "quoted", "start", "end", "subs", "stdin", "group", "literal", "bad", "raw")
+    __slots__ = ("words", "joins", "raws", "start", "end", "subs", "stdin", "group", "literal", "bad", "raw")
 
-    def __init__(self) -> None:
+    def __init__(self, raws: bool = False) -> None:
         self.words: list[str] = []
         self.joins: set[int] | None = None  # PowerShell: indexes of words joined to the one before by `,`
-        self.quoted: set[int] | None = None  # cmd: indexes of words that came from a quoted token
+        self.raws: list[str] | None = [] if raws else None  # cmd: each word's source text, quotes kept
         self.start = -1
         self.end = -1
         self.subs: list = []  # nested scripts: $( … ), backticks, <( … ), PS ( … ) and { … }
@@ -169,14 +233,16 @@ class _Stage:
 
 
 class _Builder:
-    __slots__ = ("s", "script", "pipe", "stage", "comma")
+    __slots__ = ("s", "script", "pipe", "stage", "comma", "state", "keep_raws")
 
-    def __init__(self, s: str) -> None:
+    def __init__(self, s: str, state: _State, keep_raws: bool = False) -> None:
         self.s = s
         self.script: list = []
         self.pipe: list = []
-        self.stage = _Stage()
+        self.keep_raws = keep_raws
+        self.stage = _Stage(keep_raws)
         self.comma = False
+        self.state = state
 
     def span(self, a: int, b: int) -> None:
         st = self.stage
@@ -185,7 +251,7 @@ class _Builder:
         if b > st.end:
             st.end = b
 
-    def add_word(self, w: str, a: int, b: int, literal: bool = False, quoted: bool = False) -> None:
+    def add_word(self, w: str, a: int, b: int, literal: bool = False) -> None:
         st = self.stage
         st.words.append(w)
         if st.start < 0:
@@ -198,10 +264,8 @@ class _Builder:
             self.comma = False
         if literal:
             st.literal = True
-        if quoted:
-            if st.quoted is None:
-                st.quoted = set()
-            st.quoted.add(len(st.words) - 1)
+        if st.raws is not None:
+            st.raws.append(self.s[a:b])
 
     def add_group(self, sub: list, a: int, b: int) -> None:
         if self.stage.group is not None:
@@ -215,7 +279,11 @@ class _Builder:
             if st.start >= 0:
                 st.raw = self.s[st.start : st.end].strip()
             self.pipe.append(st)
-        self.stage = _Stage()
+            budget = self.state
+            budget.ticks += 1
+            if not budget.ticks & 1023 or budget.ticks > budget.max_ticks:
+                budget.check()
+        self.stage = _Stage(self.keep_raws)
         self.comma = False
 
     def end_pipe(self) -> None:
@@ -236,12 +304,12 @@ def _skip_blanks(s: str, i: int) -> int:
     return i
 
 
-def _subs_in_text(text: str, subs: list, level: int, shell: str) -> None:
+def _subs_in_text(text: str, subs: list, level: int, shell: str, state: "_State | None" = None) -> None:
     """Command substitutions inside an expandable heredoc / here-string body."""
     pat = _B_SUBST if shell == "bash" else _P_SUBST
     if not pat.search(text):
         return
-    ctx = _Ctx(text)
+    ctx = _Ctx(text, state)
     pos = 0
     while True:
         m = pat.search(text, pos)
@@ -293,8 +361,9 @@ def _b_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
     if level > _MAX_NEST:
         raise _Malformed("nesting")
     s, n = ctx.s, ctx.n
-    b = _Builder(s)
-    while i < n:
+    b = _Builder(s, ctx.state)
+    budget = ctx.state
+    while i < n and not budget.cut:
         m = _B_TOK.match(s, i)
         if m:
             g = m.lastindex
@@ -377,7 +446,7 @@ def _b_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
                 b.add_group(sub, a, i)
                 continue
         b.add_word(w, a, i)
-    if closer is not None:
+    if closer is not None and not budget.cut:
         raise _Malformed("unclosed " + closer)
     return b.finish(), i
 
@@ -422,7 +491,7 @@ def _b_heredocs(ctx: _Ctx, i: int, level: int) -> int:
             body = re.sub(r"(?m)^\t+", "", body)
         stage.stdin.append(body)
         if not quoted:
-            _subs_in_text(body, stage.subs, level, "bash")
+            _subs_in_text(body, stage.subs, level, "bash", ctx.state)
     return i
 
 
@@ -549,7 +618,7 @@ def _b_dollar(ctx: _Ctx, i: int, subs: list, level: int) -> tuple[str, int]:
             for m in _PARENS.finditer(s, i + 3):
                 depth += 1 if m.group() == "(" else -1
                 if depth == 0:
-                    _subs_in_text(s[i + 3 : m.end() - 2], subs, level, "bash")
+                    _subs_in_text(s[i + 3 : m.end() - 2], subs, level, "bash", ctx.state)
                     return s[i : m.end()], m.end()
             raise _Malformed("arithmetic")
         sub, j = _b_list(ctx, i + 2, ")", level + 1)
@@ -560,7 +629,7 @@ def _b_dollar(ctx: _Ctx, i: int, subs: list, level: int) -> tuple[str, int]:
         for m in _BRACES.finditer(s, i + 2):
             depth += 1 if m.group() == "{" else -1
             if depth == 0:
-                _subs_in_text(s[i + 2 : m.end() - 1], subs, level, "bash")  # ${x:-$(cmd)} runs cmd
+                _subs_in_text(s[i + 2 : m.end() - 1], subs, level, "bash", ctx.state)  # ${x:-$(cmd)} runs cmd
                 return s[i : m.end()], m.end()
         raise _Malformed("parameter")
     if nx == "'":
@@ -629,7 +698,7 @@ def _b_backtick(ctx: _Ctx, i: int, subs: list, level: int) -> tuple[str, int]:
         else:
             out.append("\\")
             j = p + 1
-    sub, _ = _b_list(_Ctx("".join(out)), 0, None, level + 1)
+    sub, _ = _b_list(_Ctx("".join(out), ctx.state), 0, None, level + 1)
     subs.append(sub)
     return s[i : p + 1], p + 1
 
@@ -663,8 +732,9 @@ def _p_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
     if level > _MAX_NEST:
         raise _Malformed("nesting")
     s, n = ctx.s, ctx.n
-    b = _Builder(s)
-    while i < n:
+    b = _Builder(s, ctx.state)
+    budget = ctx.state
+    while i < n and not budget.cut:
         m = _P_TOK.match(s, i)
         if m and m.group(1) != "--%":
             g = m.lastindex
@@ -737,7 +807,7 @@ def _p_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
             i = j
             continue
         b.add_word(w, a, i, lit)
-    if closer is not None:
+    if closer is not None and not budget.cut:
         raise _Malformed("unclosed " + closer)
     return b.finish(), i
 
@@ -799,8 +869,12 @@ def _p_word(ctx: _Ctx, i: int, subs: list, level: int) -> tuple[str, int, bool]:
         elif c in "({":
             a = i
             sub, i = _p_list(ctx, i + 1, ")" if c == "(" else "}", level + 1)
-            subs.append(sub)
-            v = s[a:i]
+            lone = sub[0][0] if c == "(" and len(sub) == 1 and len(sub[0]) == 1 else None
+            if lone is not None and lone.literal and len(lone.words) == 1 and not lone.subs and lone.group is None:
+                v = lone.words[0]  # ('install') is just the string install
+            else:
+                subs.append(sub)
+                v = s[a:i]
         else:
             break
         parts.append(v)
@@ -876,7 +950,7 @@ def _p_here(ctx: _Ctx, i: int, subs: list, level: int) -> tuple[str, int]:
         raise _Malformed("here-string")
     body = s[start : end.start()] if end.start() >= start else ""
     if expandable:
-        _subs_in_text(body, subs, level, "powershell")
+        _subs_in_text(body, subs, level, "powershell", ctx.state)
     return body, end.end()
 
 
@@ -894,8 +968,9 @@ def _c_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
     if level > _MAX_NEST:
         raise _Malformed("nesting")
     s, n = ctx.s, ctx.n
-    b = _Builder(s)
-    while i < n:
+    b = _Builder(s, ctx.state, True)
+    budget = ctx.state
+    while i < n and not budget.cut:
         m = _C_TOK.match(s, i)
         # a first word that may be REM, a :label or start with @ goes the slow way
         if m and (m.lastindex != 1 or b.stage.words or (m.group(1)[0] not in ":@" and m.group(1).lower() != "rem")):
@@ -906,7 +981,7 @@ def _c_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
                 else:
                     b.end_pipe()
             else:
-                b.add_word(m.group(g), i, m.end(g) + (g > 1), quoted=g == 2)
+                b.add_word(m.group(g), i, m.end(g) + (g > 1))
             i = m.end()
             continue
         c = s[i]
@@ -926,7 +1001,7 @@ def _c_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
             sub, i = _c_list(ctx, i + 1, ")", level + 1)
             inner = s[a + 1 : i - 1].strip()
             if len(inner) > 1 and inner[0] == inner[-1] and inner[0] in "'`":  # for /f … in ('cmd')
-                sub, _ = _c_list(_Ctx(inner[1:-1]), 0, None, level + 1)
+                sub, _ = _c_list(_Ctx(inner[1:-1], ctx.state), 0, None, level + 1)
             b.add_group(sub, a, i)
             continue
         if c == ")":
@@ -952,8 +1027,8 @@ def _c_list(ctx: _Ctx, i: int, closer: str | None, level: int) -> tuple[list, in
             j = s.find("\n", i)  # REM, :: and :labels run to the end of the line, & included
             i = n if j < 0 else j
             continue
-        b.add_word(w, a, i, quoted='"' in s[a:i])
-    if closer is not None:
+        b.add_word(w, a, i)
+    if closer is not None and not budget.cut:
         raise _Malformed("unclosed " + closer)
     return b.finish(), i
 
@@ -1025,13 +1100,14 @@ def _crude(text: str, shell: str) -> list:
 def _emit_crude(script: list, shell: str, out: list) -> None:
     """Turn a crude (malformed) parse into Cmds, with bounded pipe_to (linear, not quadratic)."""
     for pipe in script:
-        acc: list = []
-        consumers = [None] * len(pipe)
+        acc = _EMPTY_PIPE
+        consumers: list = [None] * len(pipe)
         for k in range(len(pipe) - 1, -1, -1):
             consumers[k] = acc
-            acc = _bound_consumers([pipe[k].words[0]], acc)
+            acc = _prepend(pipe[k].words[0], acc)
         for k, st in enumerate(pipe):
-            out.append(Cmd(st.words, MALFORMED + st.raw, shell, list(consumers[k]), {}))
+            to = consumers[k]
+            out.append(Cmd(st.words, MALFORMED + st.raw, shell, list(to), {}, truncated=to.truncated))
 
 
 # --- unwrapping ----------------------------------------------------------------------------------
@@ -1073,7 +1149,9 @@ _SIMPLE: dict[str, tuple[frozenset, int, bool]] = {
     "noglob": (frozenset(), 0, False),
     "nocorrect": (frozenset(), 0, False),
     "coproc": (frozenset(), 0, False),
-    "firejail": (frozenset(), 0, False),
+    "firejail": (frozenset("--profile --net --name --whitelist --blacklist --noblacklist --nowhitelist "
+                           "--read-only --read-write --dns --ip --hostname --env --include --join "
+                           "--ignore --rlimit-as --timeout".split()), 0, False),
     "chroot": (frozenset({"--userspec", "--groups"}), 1, False),
     "nsenter": (frozenset({"-t", "--target", "-S", "--setuid", "-G", "--setgid"}), 0, False),
     "systemd-run": (frozenset("-u --unit -p --property --slice --description -M --machine --uid --gid "
@@ -1117,6 +1195,18 @@ _WRAPPERS = frozenset(_SIMPLE) | _POSIX_SHELLS | _PS_EXES | frozenset(
 )
 _SP_SWITCHES = frozenset({"wait", "nonewwindow", "passthru", "loaduserprofile", "usenewenvironment", "?"})
 
+# Programs that run what is piped or passed to them: every stdin/script reader this parser
+# unwraps (all POSIX shells, PowerShell, cmd, iex, parallel, privilege wrappers that start a shell)
+# plus common interpreters. Never dropped from pipe_to by the cap (names are _norm'ed).
+_EXEC_SINKS = _POSIX_SHELLS | _PS_EXES | frozenset(
+    "cmd %comspec% iex invoke-expression parallel sudo doas su sg runuser pkexec busybox wsl "
+    "eval source . xargs tee python python3 python2 py node nodejs deno bun perl ruby php lua "
+    "osascript".split()
+)
+_MAX_PIPE_TO = _MAX_PIPE_TOTAL - len(_EXEC_SINKS)  # non-sink consumers kept per Cmd
+assert _MAX_PIPE_TO >= 16, "too many exec sinks for the pipe_to cap"
+_CMD_PROG = re.compile(r"(?:.*[\\/])?(cmd(?:\.exe)?|%comspec%)((?:/.*)?)$", re.I | re.S)
+
 
 def _norm(word: str) -> str:
     """Program name for wrapper matching: last path part, lower case, no .exe/.cmd/.bat/.com."""
@@ -1143,33 +1233,31 @@ def _win_split(text: str) -> list[str]:
     return [t.replace('"', "") for t in _WIN_TOKEN.findall(text)]
 
 
-def _join_cmd(parts: list[str], force: "set | frozenset" = frozenset()) -> str:
-    if len(parts) == 1 and not force:
-        return parts[0]
-    out = []
-    for j, p in enumerate(parts):
-        need = j in force or p == "" or any(ch.isspace() for ch in p)
-        out.append(f'"{p}"' if need and '"' not in p else p)
-    return " ".join(out)
+def _join_cmd(parts: list[str]) -> str:
+    """argv words back into a Windows command line (as MSYS / PowerShell would pass them)."""
+    return " ".join(f'"{p}"' if (p == "" or any(ch.isspace() for ch in p)) and '"' not in p else p for p in parts)
 
 
-def _unwrap(argv: list[str], extra: set | None, shell: str):
+def _is_cmd_prog(word: str) -> bool:
+    lw = word.lower()
+    return ("cmd" in lw or "comspec" in lw) and _CMD_PROG.match(word) is not None
+
+
+def _unwrap(argv: list[str], extra, shell: str):
     """What `argv` runs, if it is a wrapper.
 
     None, ("argv", inner_argv, env, extra), ("script", text, shell, env), ("stdin", shell) or ("bad",).
-    `extra` is the PowerShell comma joins (for Start-Process / the `&` call operator) or, for cmd,
-    the quoted-argument index set (so `start` can tell a window title from the program).
+    `extra` is the PowerShell comma joins (Start-Process / the `&` call operator) or, for cmd, the
+    list of each argv word's raw source text (quotes kept), for `start` titles and `cmd /c`.
     """
+    raws = extra if shell == "cmd" else None
     if shell == "powershell" and argv[0] in ("&", "."):
         return ("argv", argv[1:], {}, {j - 1 for j in extra if j > 1} if extra else None)
     if shell == "bash" and argv[0].startswith("=") and len(argv[0]) > 1:  # zsh =npm equals expansion
         return ("argv", [argv[0][1:]] + argv[1:], {}, None)
-    low = argv[0].lower()
-    if shell == "cmd" and low.startswith("cmd/") and low[4:5] in ("c", "k", "r"):  # glued cmd/c
-        return _unwrap_cmd(["cmd", argv[0][3:]] + argv[1:])
+    if _is_cmd_prog(argv[0]):  # cmd, cmd.exe, %COMSPEC%, also glued: cmd/c, cmd.exe/s/c
+        return _unwrap_cmd(argv, raws)
     name = _norm(argv[0])
-    if name == "%comspec%":
-        return _unwrap_cmd(argv, extra)
     if name not in _WRAPPERS:
         return None
     spec = _SIMPLE.get(name)
@@ -1179,8 +1267,6 @@ def _unwrap(argv: list[str], extra: set | None, shell: str):
         return _unwrap_sh(argv)
     if name in _PS_EXES:
         return _unwrap_ps(argv)
-    if name == "cmd":
-        return _unwrap_cmd(argv, extra)
     if name in ("start-process", "saps") or (name == "start" and shell == "powershell"):
         return _unwrap_start_process(argv, extra)
     if name in ("iex", "invoke-expression"):
@@ -1191,9 +1277,9 @@ def _unwrap(argv: list[str], extra: set | None, shell: str):
     if name == "env":
         return _unwrap_env(argv)
     if name == "start":
-        return _unwrap_cmd_start(argv, extra)
+        return _unwrap_cmd_start(argv, raws)
     if name == "call" and shell == "cmd":
-        return ("argv", argv[1:], {}, None) if len(argv) > 1 else None
+        return ("argv", argv[1:], {}, raws[1:] if raws else None) if len(argv) > 1 else None
     if name in ("eval", "script"):
         return _unwrap_eval_script(argv, name)
     if name == "flock":
@@ -1201,7 +1287,7 @@ def _unwrap(argv: list[str], extra: set | None, shell: str):
     if name == "parallel":
         return _unwrap_parallel(argv)
     if name == "sg":
-        return _unwrap_su(argv)  # sg <group> -c "<cmd>": the -c scan is the same as su's
+        return _unwrap_sg(argv)
     if name == "command":
         rest = argv[1:]
         while rest and rest[0] in ("-p", "--"):
@@ -1316,15 +1402,13 @@ def _unwrap_eval_script(argv: list[str], name: str):
 
 
 def _unwrap_flock(argv: list[str]):
-    for i in range(1, len(argv)):  # -c "<cmd>" anywhere runs a shell command string
+    i, n = 1, len(argv)
+    while i < n:  # flock's own options, before the lock file
         w = argv[i]
-        if w in ("-c", "--command") and i + 1 < len(argv):
-            return ("script", argv[i + 1], "bash", {})
+        if w in ("-c", "--command"):
+            return ("script", argv[i + 1], "bash", {}) if i + 1 < n else None
         if w.startswith("--command="):
             return ("script", w.split("=", 1)[1], "bash", {})
-    i, n = 1, len(argv)
-    while i < n:
-        w = argv[i]
         if w in ("-w", "--timeout", "-E", "--conflict-exit-code"):
             i += 2
             continue
@@ -1332,7 +1416,12 @@ def _unwrap_flock(argv: list[str]):
             i += 1
             continue
         break
-    rest = argv[i + 1 :]  # drop the lock file / fd positional
+    j = i + 1  # after the lock file / dir / fd: `-c "<cmd>"` or the command itself
+    if j < n and argv[j] in ("-c", "--command"):
+        return ("script", argv[j + 1], "bash", {}) if j + 1 < n else None
+    if j < n and argv[j].startswith("--command="):
+        return ("script", argv[j].split("=", 1)[1], "bash", {})
+    rest = argv[j:]
     return ("argv", rest, {}, None) if rest else None
 
 
@@ -1353,7 +1442,39 @@ def _unwrap_parallel(argv: list[str]):
         started = True
         tmpl.append(w)
         i += 1
-    return ("script", " ".join(tmpl), "bash", {}) if tmpl else None
+    args: list[str] = []
+    seps = from_file = False
+    while i < n:
+        w = argv[i]
+        if w in _PARALLEL_SEP:
+            seps, from_file = True, w.startswith("::::")
+        elif not from_file:
+            args.append(w)
+        i += 1
+    template = " ".join(tmpl)
+    if not args:
+        if template:
+            return ("script", template, "bash", {})  # arguments come from stdin or a file
+        return None if seps else ("stdin", "bash")  # no template: parallel runs stdin lines as commands
+    jobs = []
+    for a in args[:_MAX_PARALLEL_JOBS]:
+        if not template:
+            jobs.append(a)  # `parallel ::: 'npm i x'`: each argument is a command
+        elif "{}" in template:
+            jobs.append(template.replace("{}", shlex.quote(a)))
+        else:
+            jobs.append(template + " " + shlex.quote(a))
+    return ("script", "\n".join(jobs), "bash", {})
+
+
+def _unwrap_sg(argv: list[str]):
+    r = _unwrap_su(argv)  # sg <group> -c "<cmd>"
+    if r is not None:
+        return r
+    rest = argv[1:]
+    if rest and rest[0] == "-":
+        rest = rest[1:]
+    return ("script", " ".join(rest[1:]), "bash", {}) if len(rest) > 1 else None  # sg <group> "<cmd>"
 
 
 def _unwrap_sh(argv: list[str]):
@@ -1426,33 +1547,41 @@ def _unwrap_ps(argv: list[str]):
     return ("stdin", "powershell")
 
 
-def _unwrap_cmd(argv: list[str], quoted: "set | None" = None):
-    i, n = 1, len(argv)
-    while i < n:
-        w = argv[i]
-        m = _CMD_SLASH_C.match(w)
-        if m:
-            first = w[m.end() :]
-            parts = ([first] if first else []) + argv[i + 1 :]
-            if not parts:
-                return None
-            # re-quote inner quoted words so `cmd /c start "t" prog` keeps its title; but a lone
-            # quoted argument (`cmd /c "npm i x"`) is just grouping and must dissolve, so skip len 1
-            force = set()
-            if quoted and len(parts) > 1:
-                base = i if first else i + 1
-                force = {j for j in range(len(parts)) if (base + j) in quoted}
-            return ("script", _join_cmd(parts, force), "cmd", {})
-        if w.startswith("/"):
-            i += 1
-            continue
-        return None
-    return ("stdin", "cmd")
+def _unwrap_cmd(argv: list[str], raws: "list[str] | None" = None):
+    """cmd / cmd.exe / %COMSPEC% with switches (glued `cmd/s/c` or spaced) and then /c, /k or /r."""
+    m = _CMD_PROG.match(argv[0])
+    tail = m.group(2) if m else ""  # switches glued to the program name, e.g. "/s/c"
+    if raws is not None and len(raws) == len(argv):
+        rest = " ".join(raws[1:])  # source text, quotes kept
+    else:
+        rest = _join_cmd(argv[1:])
+    return _cmd_tail(tail + " " + rest if rest else tail)
 
 
-def _unwrap_cmd_start(argv: list[str], quoted: set | None):
+def _cmd_tail(tail: str):
+    pos, n = 0, len(tail)
+    while True:
+        while pos < n and tail[pos] in " \t":
+            pos += 1
+        if pos >= n:
+            return ("stdin", "cmd")
+        if tail[pos] != "/":
+            return None  # cmd with an argument but no /c: nothing to run
+        if pos + 1 < n and tail[pos + 1] in "cCkKrR":
+            text = tail[pos + 2 :].lstrip(" \t")
+            if text.startswith('"'):  # cmd's outer-quote rule: drop the first and the last quote
+                last = text.rfind('"')
+                text = text[1:last] + text[last + 1 :] if last > 0 else text[1:]
+            return ("script", text, "cmd", {}) if text.strip() else None
+        pos += 1  # another switch (/s /q /d /v:on …), glued or spaced
+        while pos < n and tail[pos] not in " \t/":
+            pos += 1
+
+
+def _unwrap_cmd_start(argv: list[str], raws: "list[str] | None"):
     i, n = 1, len(argv)
     titled = False
+    have_raws = raws is not None and len(raws) == len(argv)
     while i < n:
         w = argv[i]
         lw = w.lower()
@@ -1462,14 +1591,15 @@ def _unwrap_cmd_start(argv: list[str], quoted: set | None):
         if w.startswith("/") and len(w) > 1:
             i += 1
             continue
-        # cmd's `start` reads the first quoted argument as the window title, not the program
-        if not titled and (quoted and i in quoted or w == "" or any(ch.isspace() for ch in w)):
+        # cmd's `start` reads a first argument that begins with `"` as the window title
+        title = raws[i].startswith('"') if have_raws else (w == "" or any(ch.isspace() for ch in w))
+        if not titled and title:
             titled = True
             i += 1
             continue
         break
     rest = argv[i:]
-    return ("argv", rest, {}, None) if rest else None
+    return ("argv", rest, {}, raws[i:] if have_raws else None) if rest else None
 
 
 def _sp_param(word: str) -> str | None:
@@ -1625,26 +1755,61 @@ def _cmd_strip(argv: list[str]) -> list[str]:
 # --- emitting Cmds -------------------------------------------------------------------------------
 
 
-def _bound_consumers(heads: list, acc: list) -> list:
-    """Prepend `heads` to the consumer list `acc`, deduped; keep every exec sink, cap the rest.
+class _PipeTo(list):
+    """A bounded, immutable-by-convention consumer list (nearest first) shared between stages.
 
-    This keeps pipe_to bounded (|_EXEC_SINKS| + _MAX_PIPE_TO), so one long pipeline cannot make the
-    pipe_to suffixes grow quadratically in time or memory.
+    `keys` are the _norm'ed names (dedupe key), `others` counts non-sinks, `truncated` records a
+    dropped consumer. Prepending a name already present returns the same object, so a flood of one
+    program under many spellings (`/p0/tee|/p1/tee|…`) costs O(1) per stage.
     """
-    out: list = []
-    seen: set = set()
-    extra = 0
-    for group in (heads, acc):
-        for h in group:
-            if h in seen:
-                continue
-            seen.add(h)
-            if _norm(h) in _EXEC_SINKS:
-                out.append(h)
-            elif extra < _MAX_PIPE_TO:
-                out.append(h)
-                extra += 1
-    return out
+
+    __slots__ = ("keys", "others", "truncated")
+
+
+def _new_pipe(items: list, keys: list, others: int, truncated: bool) -> _PipeTo:
+    p = _PipeTo(items)
+    p.keys, p.others, p.truncated = keys, others, truncated
+    return p
+
+
+_EMPTY_PIPE = _new_pipe([], [], 0, False)
+_NO_FEED = (None,)
+
+
+def _prepend(h: str, acc: _PipeTo) -> _PipeTo:
+    k = _norm(h)
+    if k in acc.keys:
+        return acc
+    items = [h] + acc
+    keys = [k] + acc.keys
+    others, truncated = acc.others, acc.truncated
+    if k not in _EXEC_SINKS:
+        others += 1
+        if others > _MAX_PIPE_TO:  # drop the farthest non-sink (keep the nearest consumers)
+            for j in range(len(keys) - 1, 0, -1):
+                if keys[j] not in _EXEC_SINKS:
+                    del items[j], keys[j]
+                    break
+            others -= 1
+            truncated = True
+    return _new_pipe(items, keys, others, truncated)
+
+
+def _as_pipe(names) -> _PipeTo:
+    if isinstance(names, _PipeTo):
+        return names
+    acc = _EMPTY_PIPE
+    for h in reversed(names):
+        acc = _prepend(h, acc)
+    return acc
+
+
+def _bound_consumers(heads: list, acc) -> _PipeTo:
+    """`heads` (nearest first) in front of the consumer list `acc`, deduped and capped."""
+    acc = _as_pipe(acc)
+    for h in reversed(heads):
+        acc = _prepend(h, acc)
+    return acc
 
 
 _WIN_ABS = re.compile(r"[A-Za-z]:[\\/]|\\\\")
@@ -1665,7 +1830,9 @@ def _cd_target(argv: list, shell: str):
     elif shell == "bash":
         rest = [a for a in rest if not (a.startswith("-") and len(a) > 1)]
     rest = [a for a in rest if a and not (shell == "powershell" and a.startswith("-"))]
-    return rest[0] if rest else None
+    if not rest or rest[0] == "-":
+        return None  # `cd` alone (home) and `cd -` (previous dir) are not tracked: cwd unchanged
+    return rest[0]
 
 
 def _apply_cd(cwd, target: str, shell: str):
@@ -1678,8 +1845,10 @@ def _apply_cd(cwd, target: str, shell: str):
 
 
 def _parse(text: str, shell: str, depth: int, env: dict, pipe_to: list, out: list, state: _State, cwd) -> None:
+    if state.timeup:
+        return
     try:
-        ctx = _Ctx(text)
+        ctx = _Ctx(text, state)
         if shell == "powershell":
             script, _ = _p_list(ctx, 0, None, 0)
         elif shell == "cmd":
@@ -1695,7 +1864,8 @@ def _reparse(text: str, shell: str, depth: int, env: dict, pipe_to: list, out: l
     if depth + 1 > MAX_DEPTH:
         words = text.translate(_CRUDE_STRIP[shell]).split()
         if words:
-            out.append(Cmd(words, DEPTH_LIMIT + text.strip(), shell, list(pipe_to), dict(env), cwd))
+            to = _as_pipe(pipe_to)
+            out.append(Cmd(words, DEPTH_LIMIT + text.strip(), shell, list(to), dict(env), cwd, to.truncated))
         return
     _parse(text, shell, depth + 1, env, pipe_to, out, state, cwd)
 
@@ -1714,8 +1884,8 @@ def _analyze(st: _Stage, shell: str):
         elif shell == "powershell":
             plain = w0[:1] != "$" and w0 != "&" and w0 != "."
         else:
-            plain = w0[:1] != "@" and w0.lower() not in _CMD_SPECIAL_HEADS and not w0.lower().startswith("cmd/")
-        if plain and _norm(w0) not in _WRAPPERS:
+            plain = w0[:1] != "@" and w0.lower() not in _CMD_SPECIAL_HEADS
+        if plain and _norm(w0) not in _WRAPPERS and not _is_cmd_prog(w0):
             return [(words, {})], None, [w0], None
     argv = list(words)
     assigns: dict[str, str] = {}
@@ -1764,15 +1934,17 @@ def _analyze(st: _Stage, shell: str):
                 k, v = text.split("=", 1)
                 persist = {k.strip(): v.strip()}
 
-    # `extra` carries PowerShell comma joins (for Start-Process / the call operator) or, for cmd,
-    # the set of quoted argument indexes (so `start "title" prog` knows the title from the program).
+    # `extra` carries PowerShell comma joins (Start-Process / the call operator) or, for cmd, each
+    # argv word's raw source text (quotes kept) for `start "title" prog` and `cmd /c "…"`.
+    # Stripping may drop leading words (if/do/else) or an `@` from the first word, so align on the
+    # words after the first.
     extra = None
-    marks = st.joins if shell == "powershell" else (st.quoted if shell == "cmd" else None)
-    if marks:
-        off = len(st.words) - len(argv)
-        if off >= 0 and st.words[off:] == argv:
-            lo = off if shell == "cmd" else off + 1  # cmd keeps a quoted first word; joins do not
-            extra = {j - off for j in marks if j >= lo}
+    off = len(st.words) - len(argv)
+    aligned = argv and off >= 0 and st.words[off + 1 :] == argv[1:]
+    if aligned and shell == "powershell" and st.joins:
+        extra = {j - off for j in st.joins if j > off}
+    elif aligned and shell == "cmd" and st.raws is not None and len(st.raws) == len(st.words):
+        extra = st.raws[off:]
     steps = []
     tail = None
     for _ in range(_MAX_UNWRAP):
@@ -1822,18 +1994,27 @@ def _set_env(env: dict, persist: dict, state: _State) -> None:
 
 def _emit(script: list, shell: str, depth: int, env: dict, inherit: list, out: list, state: _State, cwd=None) -> None:
     for pipeline in script:
+        if state.late():
+            return
         infos = [_analyze(st, shell) for st in pipeline]
         last = len(pipeline) - 1
-        later = [inherit] * (last + 1)  # pipe_to of each stage (bounded, nearest consumer first)
-        later_feed: list = [None] * (last + 1)  # nearest later stage that runs its stdin as a script
+        base = inherit if inherit.__class__ is _PipeTo else _as_pipe(inherit)
         if last:
-            acc, feed = inherit, None
+            later = [base] * (last + 1)  # pipe_to of each stage (bounded, nearest consumer first)
+            later_feed: list = [None] * (last + 1)  # nearest later stage running its stdin as a script
+            acc, feed = base, None
             for k in range(last, -1, -1):
                 later[k], later_feed[k] = acc, feed
-                acc = _bound_consumers(infos[k][2], acc)
-                if infos[k][1] and infos[k][1][0] == "stdin":
-                    feed = infos[k][1][1]
+                info = infos[k]
+                for h in reversed(info[2]):
+                    acc = _prepend(h, acc)
+                if info[1] and info[1][0] == "stdin":
+                    feed = info[1][1]
+        else:
+            later, later_feed = (base,), _NO_FEED
         for k, st in enumerate(pipeline):
+            if k and not k & 255 and state.late():  # long pipelines check the clock as they go
+                return
             steps, tail, heads, persist = infos[k]
             pipe_to = later[k]
             if st.group is not None:
@@ -1843,7 +2024,8 @@ def _emit(script: list, shell: str, depth: int, env: dict, inherit: list, out: l
                 raw = st.raw
                 if marked or (tail and tail[0] == "bad" and idx == len(steps) - 1):
                     raw = MALFORMED + raw
-                out.append(Cmd(argv, raw, shell, list(pipe_to), {**env, **assigns} if assigns else dict(env), cwd))
+                env_ = {**env, **assigns} if assigns else dict(env)
+                out.append(Cmd(argv, raw, shell, list(pipe_to), env_, cwd, pipe_to.truncated))
             sub_inherit = _bound_consumers(heads, pipe_to) if st.subs else None
             for sub in st.subs:  # substitutions run before the command and feed it
                 _emit(sub, shell, depth, env, sub_inherit, out, state, cwd)
@@ -1880,7 +2062,11 @@ def _dedup(cmds: list[Cmd]) -> list[Cmd]:
             seen[key] = c
             out.append(c)
             continue
+        prev.truncated = prev.truncated or c.truncated
         for p in c.pipe_to:
             if p not in prev.pipe_to:
-                prev.pipe_to.append(p)
+                if len(prev.pipe_to) < _MAX_PIPE_TOTAL:
+                    prev.pipe_to.append(p)
+                else:
+                    prev.truncated = True
     return out
