@@ -190,6 +190,14 @@ image|remote","os":["any"|"windows"|"macos"|"linux"],"test":{"hit":[…],"miss":
   watcher, limits), TEST.md (live run steps per tool), CHANGELOG 1.0.0; commit
   `docs, ci: interception table, README, TEST.md`.
 
+
+- [ ] **CI covers every OS fully** (owner requirement): `.github/workflows/test.yml` installs
+  Playwright + Chromium on all three runners (CI only) so browser tests run everywhere; macOS runs
+  the `swiftc` type-check; Windows runs `run.cmd` and PowerShell hook tests; a `tests/conftest.py`
+  hook fails the run when any test is skipped for a reason not in the per-OS allow list
+  (`requires macOS`, `requires Windows`, `requires POSIX shell`); pytest runs with `-rs` so skip
+  reasons are visible in the log.
+
 ### Task 12: Live runs (orchestrator with the owner)
 
 - [ ] tmux: Claude Code (`--plugin-dir plugins/install-guard`) and Copilot CLI with the plugin;
