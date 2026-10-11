@@ -1163,6 +1163,100 @@ def test_cwd_after_and_and_cd_is_known() -> None:
     assert find("cd /b && npm i x", ["npm", "i", "x"]).cwd == "/b"
 
 
+# --- fix round 5 ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'cmd/c"pip install evil"',
+        'cmd/c"x & pip install evil"',
+        'cmd/s/c"pip install evil"',
+        'cmd.exe/c"pip install evil"',
+        '@cmd/c"pip install evil"',
+        'cmd/c^"x ^& pip install evil^"',
+        "cmd/c^ pip install evil",
+        'start cmd/c"pip install evil"',
+    ],
+)
+def test_cmd_glued_switch_with_glued_quote_or_caret(line: str) -> None:
+    find(line, ["pip", "install", "evil"], "cmd")
+
+
+@pytest.mark.parametrize("line", ['cmd.exe/c"pip install evil"', 'cmd/c"x & pip install evil"'])
+def test_cmd_glued_switch_with_glued_quote_from_powershell(line: str) -> None:
+    find(line, ["pip", "install", "evil"], "powershell")
+
+
+def test_cmd_glued_switch_path_reading_is_unchanged() -> None:
+    find("cmd/c:x/sudo npm i evil", ["npm", "i", "evil"], "cmd")  # a folder named cmd, not cmd /c
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "parallel -l 1 npm i ::: evil",
+        "parallel -e eof npm i ::: evil",
+        "parallel -kl 1 npm i ::: evil",
+        "parallel -i npm i {} ::: evil",
+        "parallel --replace ,, npm i ,, ::: evil",
+        "parallel --eof x npm i ::: evil",
+        "parallel --max-lines 1 npm i ::: evil",
+        "parallel -Y v npm i ::: evil",  # unknown options: the same two readings
+        "parallel --made-up val npm i ::: evil",
+    ],
+)
+def test_parallel_optional_value_options_keep_both_readings_and_flag(line: str) -> None:
+    cmds = split_commands(line, "bash")
+    assert ["npm", "i", "evil"] in [c.argv for c in cmds], [c.argv for c in cmds]
+    assert any(c.truncated for c in cmds)
+
+
+def test_parallel_optional_value_glued_or_alone_is_exact() -> None:
+    cmds = split_commands("parallel -l1 npm i ::: evil", "bash")
+    assert ["npm", "i", "evil"] in [c.argv for c in cmds] and not any(c.truncated for c in cmds)
+    cmds = split_commands("parallel -l --tag npm i ::: evil", "bash")
+    assert ["npm", "i", "evil"] in [c.argv for c in cmds]
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["npm @('install';'evil')", "npm @('install'\n'evil')", "npm $('install','evil')", "npm $('install';'evil')"],
+)
+def test_powershell_statement_separated_arrays_expand(line: str) -> None:
+    find(line, ["npm", "install", "evil"], "powershell")
+
+
+def test_powershell_non_literal_subexpression_stays() -> None:
+    assert ["npm", "$(Get-Pkg)"] in argvs("npm $(Get-Pkg)", "powershell")
+    assert ["Get-Pkg"] in argvs("npm $(Get-Pkg)", "powershell")
+
+
+def test_unwrap_steps_count_toward_the_work_budget() -> None:
+    import engine.parse as parse
+
+    line = ("sudo " * 64 + "a " * 20000 + ";") * 70  # ~2.8 MB: every unwrap step copies 20k words
+    start = time.perf_counter()
+    cmds = split_commands(line, "bash")
+    elapsed = time.perf_counter() - start
+    assert cmds.budget_exceeded
+    assert cmds[0].argv[0] == "sudo"
+    assert elapsed < parse._MAX_SECONDS + 1.0, f"{elapsed:.3f}s"
+
+
+def test_unwrap_work_respects_the_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    import engine.parse as parse
+
+    monkeypatch.setattr(parse, "_MAX_SECONDS", 0.05)
+    monkeypatch.setattr(parse, "_MAX_WORDS", 10**9)  # only the clock can stop it
+    line = "npm i x; " + ("sudo " * 64 + "a " * 2000 + ";") * 700
+    start = time.perf_counter()
+    cmds = split_commands(line, "bash")
+    elapsed = time.perf_counter() - start
+    assert cmds.budget_exceeded and ["npm", "i", "x"] in [c.argv for c in cmds]
+    assert elapsed < 1.0, f"{elapsed:.3f}s"
+
+
 # --- performance ------------------------------------------------------------------------------
 
 # A generous 3 s cap catches gross slowdowns on any CI runner without being flaky; linearity (the
