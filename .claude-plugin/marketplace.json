@@ -1,0 +1,16 @@
+{
+  "name": "install-guard",
+  "owner": {
+    "name": "Zidane786"
+  },
+  "metadata": {
+    "description": "install-guard: stop coding agents from installing or downloading anything outside your allowed routes."
+  },
+  "plugins": [
+    {
+      "name": "install-guard",
+      "source": "./plugins/install-guard",
+      "description": "Stop coding agents from installing or downloading anything outside your allowed routes, in Claude Code, Copilot CLI and Kiro."
+    }
+  ]
+}
