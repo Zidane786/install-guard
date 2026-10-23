@@ -1123,6 +1123,8 @@ def test_parallel_unknown_short_option_is_flagged() -> None:
         "parallel ::: " + "true " * 64 + "'npm i evil'",
         "parallel ::: " + "true " * 200 + "'npm i evil'",
     ],
+    # short ids: pytest puts the test id in PYTEST_CURRENT_TEST, and Windows refuses a variable over 32767 characters
+    ids=["70k-argument", "64-arguments", "200-arguments"],
 )
 def test_parallel_without_template_runs_each_argument_as_its_own_command(line: str) -> None:
     find(line, ["npm", "i", "evil"])
